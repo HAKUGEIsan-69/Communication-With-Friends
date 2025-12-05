@@ -28,6 +28,8 @@ interface Message {
   timestamp: Timestamp | null;
   isBot?: boolean;
   fileName?: string;
+  fileType?: string;
+  fileSize?: number;
 }
 
 interface Task {
@@ -47,12 +49,32 @@ interface Channel {
   createdBy: string;
 }
 
+interface SharedFile {
+  id: string;
+  fileName: string;
+  fileType: string;
+  fileSize: number;
+  uploadedBy: string;
+  uploadedAt: Timestamp | null;
+  channel: string;
+  content?: string;
+}
+
 interface AISummary {
   decisions: string[];
   todos: string[];
   pending: string[];
   timestamp: Date;
 }
+
+// ============================================
+// Local Storage Keys
+// ============================================
+const STORAGE_KEYS = {
+  FIREBASE_CONFIG: 'devstream_firebase_config',
+  GEMINI_KEY: 'devstream_gemini_key',
+  USER_NAME: 'devstream_user_name',
+};
 
 // ============================================
 // Firebase Config (User provides their own)
@@ -69,6 +91,7 @@ function App() {
   const [user, setUser] = useState<User | null>(null);
   const [userName, setUserName] = useState<string>('');
   const [isUserNameSet, setIsUserNameSet] = useState(false);
+  const [rememberMe, setRememberMe] = useState(true);
 
   // Chat state
   const [messages, setMessages] = useState<Message[]>([]);
@@ -86,6 +109,9 @@ function App() {
   const [newChannelName, setNewChannelName] = useState('');
   const [showChannelForm, setShowChannelForm] = useState(false);
 
+  // File state
+  const [sharedFiles, setSharedFiles] = useState<SharedFile[]>([]);
+
   // AI state
   const [aiSummary, setAiSummary] = useState<AISummary | null>(null);
   const [fileContent, setFileContent] = useState('');
@@ -94,13 +120,59 @@ function App() {
   const [uploadedFileName, setUploadedFileName] = useState('');
 
   // Right panel tab
-  const [rightPanelTab, setRightPanelTab] = useState<'tasks' | 'summary' | 'file'>('tasks');
+  const [rightPanelTab, setRightPanelTab] = useState<'tasks' | 'files' | 'summary' | 'ai'>('tasks');
 
   // Refs
   const chatEndRef = useRef<HTMLDivElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
+  const chatFileInputRef = useRef<HTMLInputElement>(null);
   const dbRef = useRef<ReturnType<typeof getFirestore> | null>(null);
   const genAIRef = useRef<GoogleGenerativeAI | null>(null);
+
+  // ============================================
+  // Load saved credentials on mount
+  // ============================================
+  useEffect(() => {
+    const savedConfig = localStorage.getItem(STORAGE_KEYS.FIREBASE_CONFIG);
+    const savedGeminiKey = localStorage.getItem(STORAGE_KEYS.GEMINI_KEY);
+    const savedUserName = localStorage.getItem(STORAGE_KEYS.USER_NAME);
+
+    if (savedConfig) {
+      setFirebaseConfig(savedConfig);
+    }
+    if (savedGeminiKey) {
+      setGeminiApiKey(savedGeminiKey);
+    }
+    if (savedUserName) {
+      setUserName(savedUserName);
+    }
+
+    // Auto-login if all credentials exist
+    if (savedConfig && savedUserName) {
+      try {
+        const config = JSON.parse(savedConfig);
+        const app = initializeApp(config);
+        dbRef.current = getFirestore(app);
+        const auth = getAuth(app);
+
+        signInAnonymously(auth).catch(console.error);
+
+        onAuthStateChanged(auth, (user) => {
+          if (user) {
+            setUser(user);
+            setIsConfigured(true);
+            setIsUserNameSet(true);
+          }
+        });
+
+        if (savedGeminiKey) {
+          genAIRef.current = new GoogleGenerativeAI(savedGeminiKey);
+        }
+      } catch (e) {
+        console.error('Auto-login failed:', e);
+      }
+    }
+  }, []);
 
   // ============================================
   // Firebase Initialization
@@ -120,12 +192,40 @@ function App() {
         if (user) {
           setUser(user);
           setIsConfigured(true);
+
+          // Save to localStorage if remember me is checked
+          if (rememberMe) {
+            localStorage.setItem(STORAGE_KEYS.FIREBASE_CONFIG, firebaseConfig);
+            localStorage.setItem(STORAGE_KEYS.GEMINI_KEY, geminiApiKey);
+          }
         }
       });
     } catch (error) {
       alert('Invalid Firebase config JSON');
     }
-  }, [firebaseConfig]);
+  }, [firebaseConfig, geminiApiKey, rememberMe]);
+
+  // ============================================
+  // Save username
+  // ============================================
+  const handleSetUserName = () => {
+    if (userName.trim()) {
+      setIsUserNameSet(true);
+      if (rememberMe) {
+        localStorage.setItem(STORAGE_KEYS.USER_NAME, userName.trim());
+      }
+    }
+  };
+
+  // ============================================
+  // Logout function
+  // ============================================
+  const handleLogout = () => {
+    localStorage.removeItem(STORAGE_KEYS.FIREBASE_CONFIG);
+    localStorage.removeItem(STORAGE_KEYS.GEMINI_KEY);
+    localStorage.removeItem(STORAGE_KEYS.USER_NAME);
+    window.location.reload();
+  };
 
   // ============================================
   // Initialize Gemini
@@ -158,9 +258,7 @@ function App() {
       snapshot.forEach((doc) => {
         channelList.push({ id: doc.id, ...doc.data() } as Channel);
       });
-      // Add default channel if no channels exist
       if (channelList.length === 0) {
-        // Create default general channel
         addDoc(channelsRef, {
           name: 'general',
           createdAt: serverTimestamp(),
@@ -168,7 +266,6 @@ function App() {
         });
       } else {
         setChannels(channelList);
-        // Set active channel to first one if current doesn't exist
         if (!channelList.find(c => c.name === activeChannel)) {
           setActiveChannel(channelList[0].name);
         }
@@ -194,13 +291,33 @@ function App() {
       setTasks(taskList);
     });
 
+    // Shared files listener
+    const filesRef = collection(
+      dbRef.current,
+      'artifacts',
+      APP_ID,
+      'public',
+      'data',
+      'files'
+    );
+    const filesQuery = query(filesRef, orderBy('uploadedAt', 'desc'));
+
+    const unsubFiles = onSnapshot(filesQuery, (snapshot) => {
+      const fileList: SharedFile[] = [];
+      snapshot.forEach((doc) => {
+        fileList.push({ id: doc.id, ...doc.data() } as SharedFile);
+      });
+      setSharedFiles(fileList);
+    });
+
     return () => {
       unsubChannels();
       unsubTasks();
+      unsubFiles();
     };
   }, [user]);
 
-  // Messages listener (separate effect for channel changes)
+  // Messages listener
   useEffect(() => {
     if (!dbRef.current || !user || !activeChannel) return;
 
@@ -229,7 +346,7 @@ function App() {
     };
   }, [user, activeChannel]);
 
-  // Auto scroll to bottom
+  // Auto scroll
   useEffect(() => {
     chatEndRef.current?.scrollIntoView({ behavior: 'smooth' });
   }, [messages]);
@@ -243,7 +360,6 @@ function App() {
 
     const channelName = newChannelName.trim().toLowerCase().replace(/\s+/g, '-');
 
-    // Check if channel already exists
     if (channels.find(c => c.name === channelName)) {
       alert('Channel already exists!');
       return;
@@ -271,8 +387,7 @@ function App() {
 
   const deleteChannel = async (channelId: string, channelName: string) => {
     if (!dbRef.current || channelName === 'general') return;
-
-    if (!confirm(`Delete #${channelName}? This cannot be undone.`)) return;
+    if (!confirm(`Delete #${channelName}?`)) return;
 
     const channelRef = doc(
       dbRef.current,
@@ -325,18 +440,17 @@ function App() {
       'messages'
     );
 
-    // Get recent context
     const recentMessages = messages.slice(-10).map(m => `${m.userName}: ${m.text}`).join('\n');
 
     const prompt = `You are DevStream AI, a helpful assistant in a developer chat app.
-Be concise, friendly, and helpful. You can help with coding questions, task management, and general development discussions.
+Be concise, friendly, and helpful.
 
-Recent conversation context:
+Recent conversation:
 ${recentMessages}
 
 User's question: ${userMessage}
 
-Respond naturally as a chat participant:`;
+Respond naturally:`;
 
     const response = await callGemini(prompt);
 
@@ -361,27 +475,20 @@ Respond naturally as a chat participant:`;
       .map(m => `${m.userName}: ${m.text}`)
       .join('\n');
 
-    const prompt = `Analyze this development team conversation and extract:
-1. DECISIONS: Key decisions that were made
-2. TODO: Action items or tasks mentioned
-3. PENDING: Items that need follow-up or are unresolved
+    const prompt = `Analyze this conversation and extract:
+1. DECISIONS: Key decisions made
+2. TODO: Action items
+3. PENDING: Items needing follow-up
 
 Conversation:
 ${conversationText}
 
-Respond in this exact JSON format:
-{
-  "decisions": ["decision1", "decision2"],
-  "todos": ["todo1", "todo2"],
-  "pending": ["pending1", "pending2"]
-}
-
-If any category is empty, use an empty array.`;
+Respond in JSON:
+{"decisions": [], "todos": [], "pending": []}`;
 
     const response = await callGemini(prompt);
 
     try {
-      // Extract JSON from response
       const jsonMatch = response.match(/\{[\s\S]*\}/);
       if (jsonMatch) {
         const parsed = JSON.parse(jsonMatch[0]);
@@ -405,16 +512,15 @@ If any category is empty, use an empty array.`;
 
     setIsAiLoading(true);
 
-    const prompt = `Analyze and summarize this code or text content concisely.
-Highlight:
+    const prompt = `Analyze this code/text:
 - Main purpose
-- Key components/functions
-- Important notes or potential issues
+- Key components
+- Issues
 
 Content:
 ${fileContent}
 
-Provide a clear, developer-friendly summary:`;
+Summary:`;
 
     const response = await callGemini(prompt);
     setFileSummary(response);
@@ -422,13 +528,78 @@ Provide a clear, developer-friendly summary:`;
   };
 
   // ============================================
-  // File Upload Functions
+  // Chat File Upload
+  // ============================================
+  const handleChatFileUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file || !dbRef.current || !user) return;
+
+    if (file.size > 500 * 1024) {
+      alert('File too large. Max 500KB for chat uploads.');
+      return;
+    }
+
+    const reader = new FileReader();
+    reader.onload = async (event) => {
+      const content = event.target?.result as string;
+
+      // Save file metadata to Firestore
+      const filesRef = collection(
+        dbRef.current!,
+        'artifacts',
+        APP_ID,
+        'public',
+        'data',
+        'files'
+      );
+
+      await addDoc(filesRef, {
+        fileName: file.name,
+        fileType: file.type || 'text/plain',
+        fileSize: file.size,
+        uploadedBy: userName,
+        uploadedAt: serverTimestamp(),
+        channel: activeChannel,
+        content: content.substring(0, 50000), // Limit content size
+      });
+
+      // Send message about the file
+      const messagesRef = collection(
+        dbRef.current!,
+        'artifacts',
+        APP_ID,
+        'public',
+        'data',
+        'channelMessages',
+        activeChannel,
+        'messages'
+      );
+
+      await addDoc(messagesRef, {
+        text: `📎 Shared a file: ${file.name}`,
+        userId: user.uid,
+        userName: userName,
+        timestamp: serverTimestamp(),
+        isBot: false,
+        fileName: file.name,
+        fileType: file.type || 'text/plain',
+        fileSize: file.size,
+      });
+    };
+    reader.readAsText(file);
+
+    if (chatFileInputRef.current) {
+      chatFileInputRef.current.value = '';
+    }
+  };
+
+  // ============================================
+  // AI File Analysis Upload
   // ============================================
   const handleFileUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
     if (!file) return;
 
-    // Check file size (max 1MB)
     if (file.size > 1024 * 1024) {
       alert('File too large. Max 1MB.');
       return;
@@ -451,6 +622,25 @@ Provide a clear, developer-friendly summary:`;
     if (fileInputRef.current) {
       fileInputRef.current.value = '';
     }
+  };
+
+  // ============================================
+  // Delete shared file
+  // ============================================
+  const deleteSharedFile = async (fileId: string) => {
+    if (!dbRef.current) return;
+
+    const fileRef = doc(
+      dbRef.current,
+      'artifacts',
+      APP_ID,
+      'public',
+      'data',
+      'files',
+      fileId
+    );
+
+    await deleteDoc(fileRef);
   };
 
   // ============================================
@@ -482,11 +672,10 @@ Provide a clear, developer-friendly summary:`;
       isBot: false,
     });
 
-    // Check for AI mention
     if (messageText.toLowerCase().includes('@ai') || messageText.toLowerCase().startsWith('/ai ')) {
-      const query = messageText.replace(/@ai/gi, '').replace(/^\/ai /i, '').trim();
-      if (query) {
-        await handleAIChat(query);
+      const q = messageText.replace(/@ai/gi, '').replace(/^\/ai /i, '').trim();
+      if (q) {
+        await handleAIChat(q);
       }
     }
   };
@@ -572,6 +761,16 @@ Provide a clear, developer-friendly summary:`;
     return true;
   });
 
+  // Filter files for current channel
+  const channelFiles = sharedFiles.filter(f => f.channel === activeChannel);
+
+  // Format file size
+  const formatFileSize = (bytes: number) => {
+    if (bytes < 1024) return bytes + ' B';
+    if (bytes < 1024 * 1024) return (bytes / 1024).toFixed(1) + ' KB';
+    return (bytes / (1024 * 1024)).toFixed(1) + ' MB';
+  };
+
   // ============================================
   // Config Screen
   // ============================================
@@ -580,7 +779,7 @@ Provide a clear, developer-friendly summary:`;
       <div className="min-h-screen bg-gray-900 flex items-center justify-center p-4">
         <div className="bg-gray-800 rounded-xl p-8 max-w-lg w-full shadow-2xl border border-gray-700">
           <div className="text-center mb-8">
-            <h1 className="text-3xl font-bold text-white mb-2">DevStream</h1>
+            <h1 className="text-3xl font-bold text-white mb-2">⚡ DevStream</h1>
             <p className="text-gray-400">Configure your workspace</p>
           </div>
 
@@ -610,6 +809,16 @@ Provide a clear, developer-friendly summary:`;
               />
             </div>
 
+            <label className="flex items-center gap-2 text-gray-300 cursor-pointer">
+              <input
+                type="checkbox"
+                checked={rememberMe}
+                onChange={(e) => setRememberMe(e.target.checked)}
+                className="w-4 h-4 rounded border-gray-600 text-indigo-600 focus:ring-indigo-500"
+              />
+              <span className="text-sm">Remember me (save to browser)</span>
+            </label>
+
             <button
               onClick={initializeFirebase}
               disabled={!firebaseConfig}
@@ -635,7 +844,7 @@ Provide a clear, developer-friendly summary:`;
             <p className="text-gray-400">What should we call you?</p>
           </div>
 
-          <form onSubmit={(e) => { e.preventDefault(); if (userName.trim()) setIsUserNameSet(true); }} className="space-y-4">
+          <form onSubmit={(e) => { e.preventDefault(); handleSetUserName(); }} className="space-y-4">
             <input
               type="text"
               value={userName}
@@ -663,9 +872,8 @@ Provide a clear, developer-friendly summary:`;
   // ============================================
   return (
     <div className="min-h-screen bg-gray-900 flex text-gray-100">
-      {/* Left Sidebar - Channels */}
+      {/* Left Sidebar */}
       <div className="w-60 bg-gray-800 flex flex-col border-r border-gray-700">
-        {/* Workspace Header */}
         <div className="p-4 border-b border-gray-700">
           <h1 className="text-xl font-bold text-white flex items-center gap-2">
             <span className="text-2xl">⚡</span>
@@ -673,7 +881,6 @@ Provide a clear, developer-friendly summary:`;
           </h1>
         </div>
 
-        {/* Channels */}
         <div className="flex-1 overflow-y-auto p-3">
           <div className="flex items-center justify-between mb-2 px-2">
             <span className="text-xs font-semibold text-gray-400 uppercase tracking-wide">
@@ -688,7 +895,6 @@ Provide a clear, developer-friendly summary:`;
             </button>
           </div>
 
-          {/* New Channel Form */}
           {showChannelForm && (
             <form onSubmit={createChannel} className="mb-2 px-2">
               <input
@@ -703,14 +909,14 @@ Provide a clear, developer-friendly summary:`;
                 <button
                   type="submit"
                   disabled={!newChannelName.trim()}
-                  className="flex-1 bg-indigo-600 hover:bg-indigo-700 disabled:bg-gray-600 text-white text-xs py-1 rounded transition-colors"
+                  className="flex-1 bg-indigo-600 hover:bg-indigo-700 disabled:bg-gray-600 text-white text-xs py-1 rounded"
                 >
                   Create
                 </button>
                 <button
                   type="button"
                   onClick={() => { setShowChannelForm(false); setNewChannelName(''); }}
-                  className="flex-1 bg-gray-600 hover:bg-gray-500 text-white text-xs py-1 rounded transition-colors"
+                  className="flex-1 bg-gray-600 hover:bg-gray-500 text-white text-xs py-1 rounded"
                 >
                   Cancel
                 </button>
@@ -737,7 +943,7 @@ Provide a clear, developer-friendly summary:`;
               {channel.name !== 'general' && (
                 <button
                   onClick={() => deleteChannel(channel.id, channel.name)}
-                  className="px-2 py-2 text-gray-500 hover:text-red-400 opacity-0 group-hover:opacity-100 transition-all"
+                  className="px-2 py-2 text-gray-500 hover:text-red-400 opacity-0 group-hover:opacity-100"
                   title="Delete channel"
                 >
                   ×
@@ -748,7 +954,7 @@ Provide a clear, developer-friendly summary:`;
         </div>
 
         {/* User Info */}
-        <div className="p-3 border-t border-gray-700 bg-gray-850">
+        <div className="p-3 border-t border-gray-700">
           <div className="flex items-center gap-3 px-2">
             <div className="w-8 h-8 rounded-full bg-indigo-600 flex items-center justify-center text-white font-medium">
               {userName.charAt(0).toUpperCase()}
@@ -757,13 +963,19 @@ Provide a clear, developer-friendly summary:`;
               <div className="text-sm font-medium text-white truncate">{userName}</div>
               <div className="text-xs text-green-400">Online</div>
             </div>
+            <button
+              onClick={handleLogout}
+              className="text-gray-500 hover:text-red-400 text-sm"
+              title="Logout"
+            >
+              ↪
+            </button>
           </div>
         </div>
       </div>
 
       {/* Main Chat Area */}
       <div className="flex-1 flex flex-col min-w-0">
-        {/* Channel Header */}
         <div className="h-14 border-b border-gray-700 flex items-center px-4 bg-gray-800">
           <span className="text-xl text-gray-400 mr-2">#</span>
           <h2 className="font-semibold text-white">{activeChannel}</h2>
@@ -771,14 +983,9 @@ Provide a clear, developer-friendly summary:`;
             <button
               onClick={summarizeConversation}
               disabled={isAiLoading}
-              className="px-3 py-1.5 bg-indigo-600 hover:bg-indigo-700 disabled:bg-gray-600 text-white text-sm rounded-md transition-colors flex items-center gap-2"
+              className="px-3 py-1.5 bg-indigo-600 hover:bg-indigo-700 disabled:bg-gray-600 text-white text-sm rounded-md flex items-center gap-2"
             >
-              {isAiLoading ? (
-                <span className="animate-spin">⏳</span>
-              ) : (
-                <span>✨</span>
-              )}
-              Summarize Chat
+              {isAiLoading ? '⏳' : '✨'} Summarize
             </button>
           </div>
         </div>
@@ -788,7 +995,7 @@ Provide a clear, developer-friendly summary:`;
           {messages.length === 0 && (
             <div className="text-center text-gray-500 py-8">
               <p className="text-lg mb-2">No messages yet</p>
-              <p className="text-sm">Start the conversation! Use @AI to chat with the bot.</p>
+              <p className="text-sm">Use @AI to chat with the bot</p>
             </div>
           )}
 
@@ -816,6 +1023,13 @@ Provide a clear, developer-friendly summary:`;
                   </span>
                 </div>
                 <p className="text-gray-300 mt-1 whitespace-pre-wrap break-words">{message.text}</p>
+                {message.fileName && (
+                  <div className="mt-2 inline-flex items-center gap-2 bg-gray-700 rounded px-3 py-1.5 text-sm">
+                    <span>📄</span>
+                    <span>{message.fileName}</span>
+                    <span className="text-gray-500">({formatFileSize(message.fileSize || 0)})</span>
+                  </div>
+                )}
               </div>
             </div>
           ))}
@@ -840,16 +1054,31 @@ Provide a clear, developer-friendly summary:`;
         <form onSubmit={sendMessage} className="p-4 border-t border-gray-700">
           <div className="flex gap-2">
             <input
+              type="file"
+              ref={chatFileInputRef}
+              onChange={handleChatFileUpload}
+              className="hidden"
+              accept=".txt,.js,.ts,.jsx,.tsx,.py,.java,.c,.cpp,.h,.css,.html,.json,.md,.xml,.yaml,.yml,.sh,.sql"
+            />
+            <button
+              type="button"
+              onClick={() => chatFileInputRef.current?.click()}
+              className="px-3 bg-gray-700 hover:bg-gray-600 text-gray-400 hover:text-white rounded-lg transition-colors"
+              title="Upload file"
+            >
+              📎
+            </button>
+            <input
               type="text"
               value={newMessage}
               onChange={(e) => setNewMessage(e.target.value)}
-              className="flex-1 bg-gray-700 text-white rounded-lg px-4 py-3 border border-gray-600 focus:border-indigo-500 focus:ring-1 focus:ring-indigo-500 outline-none"
-              placeholder={`Message #${activeChannel} (use @AI to chat with bot)`}
+              className="flex-1 bg-gray-700 text-white rounded-lg px-4 py-3 border border-gray-600 focus:border-indigo-500 outline-none"
+              placeholder={`Message #${activeChannel} (@AI for bot)`}
             />
             <button
               type="submit"
               disabled={!newMessage.trim()}
-              className="px-6 bg-indigo-600 hover:bg-indigo-700 disabled:bg-gray-600 disabled:cursor-not-allowed text-white font-medium rounded-lg transition-colors"
+              className="px-6 bg-indigo-600 hover:bg-indigo-700 disabled:bg-gray-600 text-white font-medium rounded-lg"
             >
               Send
             </button>
@@ -857,77 +1086,59 @@ Provide a clear, developer-friendly summary:`;
         </form>
       </div>
 
-      {/* Right Sidebar - Tasks & AI */}
+      {/* Right Sidebar */}
       <div className="w-80 bg-gray-800 border-l border-gray-700 flex flex-col">
-        {/* Tabs */}
         <div className="flex border-b border-gray-700">
-          <button
-            onClick={() => setRightPanelTab('tasks')}
-            className={`flex-1 py-3 text-sm font-medium transition-colors ${
-              rightPanelTab === 'tasks'
-                ? 'text-indigo-400 border-b-2 border-indigo-400'
-                : 'text-gray-400 hover:text-gray-200'
-            }`}
-          >
-            Tasks
-          </button>
-          <button
-            onClick={() => setRightPanelTab('summary')}
-            className={`flex-1 py-3 text-sm font-medium transition-colors ${
-              rightPanelTab === 'summary'
-                ? 'text-indigo-400 border-b-2 border-indigo-400'
-                : 'text-gray-400 hover:text-gray-200'
-            }`}
-          >
-            Summary
-          </button>
-          <button
-            onClick={() => setRightPanelTab('file')}
-            className={`flex-1 py-3 text-sm font-medium transition-colors ${
-              rightPanelTab === 'file'
-                ? 'text-indigo-400 border-b-2 border-indigo-400'
-                : 'text-gray-400 hover:text-gray-200'
-            }`}
-          >
-            File AI
-          </button>
+          {(['tasks', 'files', 'summary', 'ai'] as const).map((tab) => (
+            <button
+              key={tab}
+              onClick={() => setRightPanelTab(tab)}
+              className={`flex-1 py-3 text-xs font-medium transition-colors ${
+                rightPanelTab === tab
+                  ? 'text-indigo-400 border-b-2 border-indigo-400'
+                  : 'text-gray-400 hover:text-gray-200'
+              }`}
+            >
+              {tab === 'tasks' && 'Tasks'}
+              {tab === 'files' && 'Files'}
+              {tab === 'summary' && 'Summary'}
+              {tab === 'ai' && 'AI'}
+            </button>
+          ))}
         </div>
 
-        {/* Tab Content */}
         <div className="flex-1 overflow-y-auto">
           {/* Tasks Tab */}
           {rightPanelTab === 'tasks' && (
             <div className="p-4">
-              {/* Add Task Form */}
               <form onSubmit={addTask} className="mb-4">
                 <div className="flex gap-2">
                   <input
                     type="text"
                     value={newTaskTitle}
                     onChange={(e) => setNewTaskTitle(e.target.value)}
-                    className="flex-1 bg-gray-700 text-white rounded-lg px-3 py-2 border border-gray-600 focus:border-indigo-500 outline-none text-sm"
+                    className="flex-1 bg-gray-700 text-white rounded-lg px-3 py-2 border border-gray-600 text-sm"
                     placeholder="Add a task..."
                   />
                   <button
                     type="submit"
                     disabled={!newTaskTitle.trim()}
-                    className="px-3 bg-indigo-600 hover:bg-indigo-700 disabled:bg-gray-600 text-white rounded-lg transition-colors"
+                    className="px-3 bg-indigo-600 hover:bg-indigo-700 disabled:bg-gray-600 text-white rounded-lg"
                   >
                     +
                   </button>
                 </div>
               </form>
 
-              {/* Filter */}
               <div className="flex gap-1 mb-4">
                 {(['all', 'active', 'completed'] as const).map((filter) => (
                   <button
                     key={filter}
                     onClick={() => setTaskFilter(filter)}
-                    className={`px-3 py-1 text-xs rounded-full transition-colors ${
+                    className={`px-3 py-1 text-xs rounded-full ${
                       taskFilter === filter
                         ? 'bg-indigo-600 text-white'
-                        : 'bg-gray-700 text-gray-400 hover:text-white'
+                        : 'bg-gray-700 text-gray-400'
                     }`}
                   >
                     {filter.charAt(0).toUpperCase() + filter.slice(1)}
@@ -935,7 +1146,6 @@ Provide a clear, developer-friendly summary:`;
                 ))}
               </div>
 
-              {/* Task List */}
               <div className="space-y-2">
                 {filteredTasks.length === 0 && (
                   <p className="text-gray-500 text-sm text-center py-4">No tasks</p>
@@ -944,22 +1154,20 @@ Provide a clear, developer-friendly summary:`;
                 {filteredTasks.map((task) => (
                   <div
                     key={task.id}
-                    className={`p-3 rounded-lg border transition-all ${
-                      task.completed
-                        ? 'bg-gray-700/50 border-gray-600'
-                        : 'bg-gray-700 border-gray-600 hover:border-gray-500'
+                    className={`p-3 rounded-lg border ${
+                      task.completed ? 'bg-gray-700/50 border-gray-600' : 'bg-gray-700 border-gray-600'
                     }`}
                   >
                     <div className="flex items-start gap-3">
                       <button
                         onClick={() => toggleTask(task.id, task.completed)}
-                        className={`w-5 h-5 rounded border-2 flex items-center justify-center flex-shrink-0 mt-0.5 transition-colors ${
+                        className={`w-5 h-5 rounded border-2 flex items-center justify-center flex-shrink-0 mt-0.5 ${
                           task.completed
                             ? 'bg-green-600 border-green-600 text-white'
                             : 'border-gray-500 hover:border-indigo-500'
                         }`}
                       >
-                        {task.completed && <span className="text-xs">✓</span>}
+                        {task.completed && '✓'}
                       </button>
                       <div className="flex-1 min-w-0">
                         <p className={`text-sm ${task.completed ? 'text-gray-500 line-through' : 'text-white'}`}>
@@ -970,7 +1178,7 @@ Provide a clear, developer-friendly summary:`;
                           <select
                             value={task.priority}
                             onChange={(e) => updateTaskPriority(task.id, e.target.value as 'low' | 'medium' | 'high')}
-                            className={`text-xs px-2 py-0.5 rounded-full border-0 cursor-pointer ${
+                            className={`text-xs px-2 py-0.5 rounded-full border-0 ${
                               task.priority === 'high'
                                 ? 'bg-red-500/20 text-red-400'
                                 : task.priority === 'medium'
@@ -986,7 +1194,7 @@ Provide a clear, developer-friendly summary:`;
                       </div>
                       <button
                         onClick={() => deleteTask(task.id)}
-                        className="text-gray-500 hover:text-red-400 transition-colors"
+                        className="text-gray-500 hover:text-red-400"
                       >
                         ✕
                       </button>
@@ -997,13 +1205,68 @@ Provide a clear, developer-friendly summary:`;
             </div>
           )}
 
+          {/* Files Tab */}
+          {rightPanelTab === 'files' && (
+            <div className="p-4">
+              <h3 className="text-sm font-semibold text-gray-300 mb-3">
+                Files in #{activeChannel}
+              </h3>
+              {channelFiles.length === 0 ? (
+                <div className="text-center text-gray-500 py-8">
+                  <p className="text-4xl mb-2">📁</p>
+                  <p className="text-sm">No files shared yet</p>
+                  <p className="text-xs mt-1">Use 📎 in chat to share files</p>
+                </div>
+              ) : (
+                <div className="space-y-2">
+                  {channelFiles.map((file) => (
+                    <div
+                      key={file.id}
+                      className="p-3 bg-gray-700 rounded-lg border border-gray-600"
+                    >
+                      <div className="flex items-start gap-3">
+                        <span className="text-2xl">📄</span>
+                        <div className="flex-1 min-w-0">
+                          <p className="text-sm text-white truncate">{file.fileName}</p>
+                          <p className="text-xs text-gray-500">
+                            {formatFileSize(file.fileSize)} • by {file.uploadedBy}
+                          </p>
+                          <p className="text-xs text-gray-500">
+                            {file.uploadedAt?.toDate?.()?.toLocaleString() || 'Just now'}
+                          </p>
+                        </div>
+                        <button
+                          onClick={() => deleteSharedFile(file.id)}
+                          className="text-gray-500 hover:text-red-400"
+                        >
+                          ✕
+                        </button>
+                      </div>
+                      {file.content && (
+                        <details className="mt-2">
+                          <summary className="text-xs text-indigo-400 cursor-pointer">
+                            View content
+                          </summary>
+                          <pre className="mt-2 p-2 bg-gray-800 rounded text-xs text-gray-300 overflow-auto max-h-40">
+                            {file.content.substring(0, 2000)}
+                            {file.content.length > 2000 && '...'}
+                          </pre>
+                        </details>
+                      )}
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
+          )}
+
           {/* Summary Tab */}
           {rightPanelTab === 'summary' && (
             <div className="p-4">
               {!aiSummary ? (
                 <div className="text-center text-gray-500 py-8">
                   <p className="text-4xl mb-4">📊</p>
-                  <p className="text-sm">Click "Summarize Chat" to analyze the conversation</p>
+                  <p className="text-sm">Click "Summarize" to analyze the conversation</p>
                 </div>
               ) : (
                 <div className="space-y-4">
@@ -1011,13 +1274,10 @@ Provide a clear, developer-friendly summary:`;
                     Generated at {aiSummary.timestamp.toLocaleTimeString()}
                   </div>
 
-                  {/* Decisions */}
                   <div>
-                    <h3 className="text-sm font-semibold text-green-400 mb-2 flex items-center gap-2">
-                      <span>✅</span> Decisions
-                    </h3>
+                    <h3 className="text-sm font-semibold text-green-400 mb-2">✅ Decisions</h3>
                     {aiSummary.decisions.length === 0 ? (
-                      <p className="text-gray-500 text-sm">No decisions found</p>
+                      <p className="text-gray-500 text-sm">None</p>
                     ) : (
                       <ul className="space-y-1">
                         {aiSummary.decisions.map((item, i) => (
@@ -1029,13 +1289,10 @@ Provide a clear, developer-friendly summary:`;
                     )}
                   </div>
 
-                  {/* To-Dos */}
                   <div>
-                    <h3 className="text-sm font-semibold text-yellow-400 mb-2 flex items-center gap-2">
-                      <span>📋</span> To-Do
-                    </h3>
+                    <h3 className="text-sm font-semibold text-yellow-400 mb-2">📋 To-Do</h3>
                     {aiSummary.todos.length === 0 ? (
-                      <p className="text-gray-500 text-sm">No to-dos found</p>
+                      <p className="text-gray-500 text-sm">None</p>
                     ) : (
                       <ul className="space-y-1">
                         {aiSummary.todos.map((item, i) => (
@@ -1047,13 +1304,10 @@ Provide a clear, developer-friendly summary:`;
                     )}
                   </div>
 
-                  {/* Pending */}
                   <div>
-                    <h3 className="text-sm font-semibold text-orange-400 mb-2 flex items-center gap-2">
-                      <span>⏳</span> Pending
-                    </h3>
+                    <h3 className="text-sm font-semibold text-orange-400 mb-2">⏳ Pending</h3>
                     {aiSummary.pending.length === 0 ? (
-                      <p className="text-gray-500 text-sm">No pending items</p>
+                      <p className="text-gray-500 text-sm">None</p>
                     ) : (
                       <ul className="space-y-1">
                         {aiSummary.pending.map((item, i) => (
@@ -1069,74 +1323,52 @@ Provide a clear, developer-friendly summary:`;
             </div>
           )}
 
-          {/* File AI Tab */}
-          {rightPanelTab === 'file' && (
+          {/* AI Analysis Tab */}
+          {rightPanelTab === 'ai' && (
             <div className="p-4 space-y-4">
-              {/* File Upload Button */}
               <div>
                 <input
                   type="file"
                   ref={fileInputRef}
                   onChange={handleFileUpload}
-                  accept=".txt,.js,.ts,.jsx,.tsx,.py,.java,.c,.cpp,.h,.css,.html,.json,.md,.xml,.yaml,.yml,.sh,.sql,.go,.rs,.rb,.php"
+                  accept=".txt,.js,.ts,.jsx,.tsx,.py,.java,.c,.cpp,.h,.css,.html,.json,.md"
                   className="hidden"
                 />
                 <button
                   onClick={() => fileInputRef.current?.click()}
-                  className="w-full py-3 border-2 border-dashed border-gray-600 hover:border-indigo-500 rounded-lg text-gray-400 hover:text-indigo-400 transition-colors flex items-center justify-center gap-2"
+                  className="w-full py-3 border-2 border-dashed border-gray-600 hover:border-indigo-500 rounded-lg text-gray-400 hover:text-indigo-400 flex items-center justify-center gap-2"
                 >
-                  <span>📁</span>
-                  Upload File
+                  📁 Upload for Analysis
                 </button>
               </div>
 
-              {/* Uploaded File Info */}
               {uploadedFileName && (
                 <div className="flex items-center justify-between bg-gray-700/50 rounded-lg px-3 py-2">
                   <span className="text-sm text-gray-300 truncate">📄 {uploadedFileName}</span>
-                  <button
-                    onClick={clearFile}
-                    className="text-gray-500 hover:text-red-400 transition-colors ml-2"
-                  >
+                  <button onClick={clearFile} className="text-gray-500 hover:text-red-400 ml-2">
                     ✕
                   </button>
                 </div>
               )}
 
-              {/* Text Area */}
-              <div>
-                <label className="block text-sm font-medium text-gray-300 mb-2">
-                  {uploadedFileName ? 'File content:' : 'Or paste code/text:'}
-                </label>
-                <textarea
-                  value={fileContent}
-                  onChange={(e) => setFileContent(e.target.value)}
-                  className="w-full h-40 bg-gray-700 text-white rounded-lg p-3 border border-gray-600 focus:border-indigo-500 outline-none font-mono text-sm resize-none"
-                  placeholder="Paste your code or text here..."
-                />
-              </div>
+              <textarea
+                value={fileContent}
+                onChange={(e) => setFileContent(e.target.value)}
+                className="w-full h-32 bg-gray-700 text-white rounded-lg p-3 border border-gray-600 font-mono text-sm resize-none"
+                placeholder="Or paste code here..."
+              />
 
               <button
                 onClick={summarizeFile}
                 disabled={!fileContent.trim() || isAiLoading}
-                className="w-full py-2 bg-indigo-600 hover:bg-indigo-700 disabled:bg-gray-600 text-white rounded-lg transition-colors flex items-center justify-center gap-2"
+                className="w-full py-2 bg-indigo-600 hover:bg-indigo-700 disabled:bg-gray-600 text-white rounded-lg flex items-center justify-center gap-2"
               >
-                {isAiLoading ? (
-                  <>
-                    <span className="animate-spin">⏳</span>
-                    Analyzing...
-                  </>
-                ) : (
-                  <>
-                    <span>✨</span>
-                    Analyze Content
-                  </>
-                )}
+                {isAiLoading ? '⏳ Analyzing...' : '✨ Analyze'}
               </button>
 
               {fileSummary && (
-                <div className="mt-4 p-4 bg-gray-700/50 rounded-lg border border-gray-600">
-                  <h3 className="text-sm font-semibold text-indigo-400 mb-2">Analysis Result</h3>
+                <div className="p-4 bg-gray-700/50 rounded-lg border border-gray-600">
+                  <h3 className="text-sm font-semibold text-indigo-400 mb-2">Result</h3>
                   <p className="text-sm text-gray-300 whitespace-pre-wrap">{fileSummary}</p>
                 </div>
               )}
