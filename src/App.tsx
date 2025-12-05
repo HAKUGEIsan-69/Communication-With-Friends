@@ -27,6 +27,7 @@ interface Message {
   userName: string;
   timestamp: Timestamp | null;
   isBot?: boolean;
+  fileName?: string;
 }
 
 interface Task {
@@ -35,6 +36,13 @@ interface Task {
   completed: boolean;
   assignee?: string;
   priority: 'low' | 'medium' | 'high';
+  createdAt: Timestamp | null;
+  createdBy: string;
+}
+
+interface Channel {
+  id: string;
+  name: string;
   createdAt: Timestamp | null;
   createdBy: string;
 }
@@ -72,20 +80,25 @@ function App() {
   const [newTaskTitle, setNewTaskTitle] = useState('');
   const [taskFilter, setTaskFilter] = useState<'all' | 'active' | 'completed'>('all');
 
+  // Channel state
+  const [channels, setChannels] = useState<Channel[]>([]);
+  const [activeChannel, setActiveChannel] = useState('general');
+  const [newChannelName, setNewChannelName] = useState('');
+  const [showChannelForm, setShowChannelForm] = useState(false);
+
   // AI state
   const [aiSummary, setAiSummary] = useState<AISummary | null>(null);
   const [fileContent, setFileContent] = useState('');
   const [fileSummary, setFileSummary] = useState('');
   const [isAiLoading, setIsAiLoading] = useState(false);
-
-  // Active channel
-  const [activeChannel, setActiveChannel] = useState('general');
+  const [uploadedFileName, setUploadedFileName] = useState('');
 
   // Right panel tab
   const [rightPanelTab, setRightPanelTab] = useState<'tasks' | 'summary' | 'file'>('tasks');
 
   // Refs
   const chatEndRef = useRef<HTMLDivElement>(null);
+  const fileInputRef = useRef<HTMLInputElement>(null);
   const dbRef = useRef<ReturnType<typeof getFirestore> | null>(null);
   const genAIRef = useRef<GoogleGenerativeAI | null>(null);
 
@@ -129,25 +142,37 @@ function App() {
   useEffect(() => {
     if (!dbRef.current || !user) return;
 
-    // Messages listener
-    const messagesRef = collection(
+    // Channels listener
+    const channelsRef = collection(
       dbRef.current,
       'artifacts',
       APP_ID,
       'public',
       'data',
-      'channels',
-      activeChannel,
-      'messages'
+      'channels'
     );
-    const messagesQuery = query(messagesRef, orderBy('timestamp', 'asc'));
+    const channelsQuery = query(channelsRef, orderBy('createdAt', 'asc'));
 
-    const unsubMessages = onSnapshot(messagesQuery, (snapshot) => {
-      const msgs: Message[] = [];
+    const unsubChannels = onSnapshot(channelsQuery, (snapshot) => {
+      const channelList: Channel[] = [];
       snapshot.forEach((doc) => {
-        msgs.push({ id: doc.id, ...doc.data() } as Message);
+        channelList.push({ id: doc.id, ...doc.data() } as Channel);
       });
-      setMessages(msgs);
+      // Add default channel if no channels exist
+      if (channelList.length === 0) {
+        // Create default general channel
+        addDoc(channelsRef, {
+          name: 'general',
+          createdAt: serverTimestamp(),
+          createdBy: 'system',
+        });
+      } else {
+        setChannels(channelList);
+        // Set active channel to first one if current doesn't exist
+        if (!channelList.find(c => c.name === activeChannel)) {
+          setActiveChannel(channelList[0].name);
+        }
+      }
     });
 
     // Tasks listener
@@ -170,8 +195,37 @@ function App() {
     });
 
     return () => {
-      unsubMessages();
+      unsubChannels();
       unsubTasks();
+    };
+  }, [user]);
+
+  // Messages listener (separate effect for channel changes)
+  useEffect(() => {
+    if (!dbRef.current || !user || !activeChannel) return;
+
+    const messagesRef = collection(
+      dbRef.current,
+      'artifacts',
+      APP_ID,
+      'public',
+      'data',
+      'channelMessages',
+      activeChannel,
+      'messages'
+    );
+    const messagesQuery = query(messagesRef, orderBy('timestamp', 'asc'));
+
+    const unsubMessages = onSnapshot(messagesQuery, (snapshot) => {
+      const msgs: Message[] = [];
+      snapshot.forEach((doc) => {
+        msgs.push({ id: doc.id, ...doc.data() } as Message);
+      });
+      setMessages(msgs);
+    });
+
+    return () => {
+      unsubMessages();
     };
   }, [user, activeChannel]);
 
@@ -179,6 +233,63 @@ function App() {
   useEffect(() => {
     chatEndRef.current?.scrollIntoView({ behavior: 'smooth' });
   }, [messages]);
+
+  // ============================================
+  // Channel Functions
+  // ============================================
+  const createChannel = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!newChannelName.trim() || !dbRef.current || !user) return;
+
+    const channelName = newChannelName.trim().toLowerCase().replace(/\s+/g, '-');
+
+    // Check if channel already exists
+    if (channels.find(c => c.name === channelName)) {
+      alert('Channel already exists!');
+      return;
+    }
+
+    const channelsRef = collection(
+      dbRef.current,
+      'artifacts',
+      APP_ID,
+      'public',
+      'data',
+      'channels'
+    );
+
+    await addDoc(channelsRef, {
+      name: channelName,
+      createdAt: serverTimestamp(),
+      createdBy: userName,
+    });
+
+    setNewChannelName('');
+    setShowChannelForm(false);
+    setActiveChannel(channelName);
+  };
+
+  const deleteChannel = async (channelId: string, channelName: string) => {
+    if (!dbRef.current || channelName === 'general') return;
+
+    if (!confirm(`Delete #${channelName}? This cannot be undone.`)) return;
+
+    const channelRef = doc(
+      dbRef.current,
+      'artifacts',
+      APP_ID,
+      'public',
+      'data',
+      'channels',
+      channelId
+    );
+
+    await deleteDoc(channelRef);
+
+    if (activeChannel === channelName) {
+      setActiveChannel('general');
+    }
+  };
 
   // ============================================
   // AI Functions
@@ -209,7 +320,7 @@ function App() {
       APP_ID,
       'public',
       'data',
-      'channels',
+      'channelMessages',
       activeChannel,
       'messages'
     );
@@ -311,6 +422,38 @@ Provide a clear, developer-friendly summary:`;
   };
 
   // ============================================
+  // File Upload Functions
+  // ============================================
+  const handleFileUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+
+    // Check file size (max 1MB)
+    if (file.size > 1024 * 1024) {
+      alert('File too large. Max 1MB.');
+      return;
+    }
+
+    const reader = new FileReader();
+    reader.onload = (event) => {
+      const content = event.target?.result as string;
+      setFileContent(content);
+      setUploadedFileName(file.name);
+      setFileSummary('');
+    };
+    reader.readAsText(file);
+  };
+
+  const clearFile = () => {
+    setFileContent('');
+    setUploadedFileName('');
+    setFileSummary('');
+    if (fileInputRef.current) {
+      fileInputRef.current.value = '';
+    }
+  };
+
+  // ============================================
   // Message Functions
   // ============================================
   const sendMessage = async (e: React.FormEvent) => {
@@ -326,7 +469,7 @@ Provide a clear, developer-friendly summary:`;
       APP_ID,
       'public',
       'data',
-      'channels',
+      'channelMessages',
       activeChannel,
       'messages'
     );
@@ -430,11 +573,6 @@ Provide a clear, developer-friendly summary:`;
   });
 
   // ============================================
-  // Channel List
-  // ============================================
-  const channels = ['general', 'development', 'design', 'random'];
-
-  // ============================================
   // Config Screen
   // ============================================
   if (!isConfigured) {
@@ -530,29 +668,82 @@ Provide a clear, developer-friendly summary:`;
         {/* Workspace Header */}
         <div className="p-4 border-b border-gray-700">
           <h1 className="text-xl font-bold text-white flex items-center gap-2">
-            <span className="text-2xl">&#9889;</span>
+            <span className="text-2xl">⚡</span>
             DevStream
           </h1>
         </div>
 
         {/* Channels */}
         <div className="flex-1 overflow-y-auto p-3">
-          <div className="text-xs font-semibold text-gray-400 uppercase tracking-wide mb-2 px-2">
-            Channels
-          </div>
-          {channels.map((channel) => (
+          <div className="flex items-center justify-between mb-2 px-2">
+            <span className="text-xs font-semibold text-gray-400 uppercase tracking-wide">
+              Channels
+            </span>
             <button
-              key={channel}
-              onClick={() => setActiveChannel(channel)}
-              className={`w-full text-left px-3 py-2 rounded-md mb-1 flex items-center gap-2 transition-colors ${
-                activeChannel === channel
+              onClick={() => setShowChannelForm(!showChannelForm)}
+              className="text-gray-400 hover:text-white transition-colors text-lg"
+              title="Create channel"
+            >
+              +
+            </button>
+          </div>
+
+          {/* New Channel Form */}
+          {showChannelForm && (
+            <form onSubmit={createChannel} className="mb-2 px-2">
+              <input
+                type="text"
+                value={newChannelName}
+                onChange={(e) => setNewChannelName(e.target.value)}
+                className="w-full bg-gray-700 text-white rounded px-2 py-1 text-sm border border-gray-600 focus:border-indigo-500 outline-none"
+                placeholder="channel-name"
+                autoFocus
+              />
+              <div className="flex gap-1 mt-1">
+                <button
+                  type="submit"
+                  disabled={!newChannelName.trim()}
+                  className="flex-1 bg-indigo-600 hover:bg-indigo-700 disabled:bg-gray-600 text-white text-xs py-1 rounded transition-colors"
+                >
+                  Create
+                </button>
+                <button
+                  type="button"
+                  onClick={() => { setShowChannelForm(false); setNewChannelName(''); }}
+                  className="flex-1 bg-gray-600 hover:bg-gray-500 text-white text-xs py-1 rounded transition-colors"
+                >
+                  Cancel
+                </button>
+              </div>
+            </form>
+          )}
+
+          {channels.map((channel) => (
+            <div
+              key={channel.id}
+              className={`group flex items-center justify-between rounded-md mb-1 transition-colors ${
+                activeChannel === channel.name
                   ? 'bg-indigo-600 text-white'
                   : 'text-gray-400 hover:bg-gray-700 hover:text-gray-200'
               }`}
             >
-              <span className="text-lg">#</span>
-              {channel}
-            </button>
+              <button
+                onClick={() => setActiveChannel(channel.name)}
+                className="flex-1 text-left px-3 py-2 flex items-center gap-2"
+              >
+                <span className="text-lg">#</span>
+                {channel.name}
+              </button>
+              {channel.name !== 'general' && (
+                <button
+                  onClick={() => deleteChannel(channel.id, channel.name)}
+                  className="px-2 py-2 text-gray-500 hover:text-red-400 opacity-0 group-hover:opacity-100 transition-all"
+                  title="Delete channel"
+                >
+                  ×
+                </button>
+              )}
+            </div>
           ))}
         </div>
 
@@ -583,9 +774,9 @@ Provide a clear, developer-friendly summary:`;
               className="px-3 py-1.5 bg-indigo-600 hover:bg-indigo-700 disabled:bg-gray-600 text-white text-sm rounded-md transition-colors flex items-center gap-2"
             >
               {isAiLoading ? (
-                <span className="animate-spin">&#8987;</span>
+                <span className="animate-spin">⏳</span>
               ) : (
-                <span>&#10024;</span>
+                <span>✨</span>
               )}
               Summarize Chat
             </button>
@@ -613,7 +804,7 @@ Provide a clear, developer-friendly summary:`;
                     : 'bg-gray-600'
                 }`}
               >
-                {message.isBot ? '&#129302;' : message.userName.charAt(0).toUpperCase()}
+                {message.isBot ? '🤖' : message.userName.charAt(0).toUpperCase()}
               </div>
               <div className="flex-1 min-w-0">
                 <div className="flex items-baseline gap-2">
@@ -632,7 +823,7 @@ Provide a clear, developer-friendly summary:`;
           {isTyping && (
             <div className="flex gap-3 items-center text-gray-400">
               <div className="w-10 h-10 rounded-full bg-gradient-to-br from-purple-500 to-indigo-600 flex items-center justify-center text-white">
-                &#129302;
+                🤖
               </div>
               <div className="flex gap-1">
                 <span className="w-2 h-2 bg-gray-400 rounded-full animate-bounce" style={{ animationDelay: '0ms' }}></span>
@@ -768,7 +959,7 @@ Provide a clear, developer-friendly summary:`;
                             : 'border-gray-500 hover:border-indigo-500'
                         }`}
                       >
-                        {task.completed && <span className="text-xs">&#10003;</span>}
+                        {task.completed && <span className="text-xs">✓</span>}
                       </button>
                       <div className="flex-1 min-w-0">
                         <p className={`text-sm ${task.completed ? 'text-gray-500 line-through' : 'text-white'}`}>
@@ -797,7 +988,7 @@ Provide a clear, developer-friendly summary:`;
                         onClick={() => deleteTask(task.id)}
                         className="text-gray-500 hover:text-red-400 transition-colors"
                       >
-                        &#10005;
+                        ✕
                       </button>
                     </div>
                   </div>
@@ -811,7 +1002,7 @@ Provide a clear, developer-friendly summary:`;
             <div className="p-4">
               {!aiSummary ? (
                 <div className="text-center text-gray-500 py-8">
-                  <p className="text-4xl mb-4">&#128202;</p>
+                  <p className="text-4xl mb-4">📊</p>
                   <p className="text-sm">Click "Summarize Chat" to analyze the conversation</p>
                 </div>
               ) : (
@@ -823,7 +1014,7 @@ Provide a clear, developer-friendly summary:`;
                   {/* Decisions */}
                   <div>
                     <h3 className="text-sm font-semibold text-green-400 mb-2 flex items-center gap-2">
-                      <span>&#9989;</span> Decisions
+                      <span>✅</span> Decisions
                     </h3>
                     {aiSummary.decisions.length === 0 ? (
                       <p className="text-gray-500 text-sm">No decisions found</p>
@@ -841,7 +1032,7 @@ Provide a clear, developer-friendly summary:`;
                   {/* To-Dos */}
                   <div>
                     <h3 className="text-sm font-semibold text-yellow-400 mb-2 flex items-center gap-2">
-                      <span>&#128203;</span> To-Do
+                      <span>📋</span> To-Do
                     </h3>
                     {aiSummary.todos.length === 0 ? (
                       <p className="text-gray-500 text-sm">No to-dos found</p>
@@ -859,7 +1050,7 @@ Provide a clear, developer-friendly summary:`;
                   {/* Pending */}
                   <div>
                     <h3 className="text-sm font-semibold text-orange-400 mb-2 flex items-center gap-2">
-                      <span>&#9203;</span> Pending
+                      <span>⏳</span> Pending
                     </h3>
                     {aiSummary.pending.length === 0 ? (
                       <p className="text-gray-500 text-sm">No pending items</p>
@@ -881,9 +1072,41 @@ Provide a clear, developer-friendly summary:`;
           {/* File AI Tab */}
           {rightPanelTab === 'file' && (
             <div className="p-4 space-y-4">
+              {/* File Upload Button */}
+              <div>
+                <input
+                  type="file"
+                  ref={fileInputRef}
+                  onChange={handleFileUpload}
+                  accept=".txt,.js,.ts,.jsx,.tsx,.py,.java,.c,.cpp,.h,.css,.html,.json,.md,.xml,.yaml,.yml,.sh,.sql,.go,.rs,.rb,.php"
+                  className="hidden"
+                />
+                <button
+                  onClick={() => fileInputRef.current?.click()}
+                  className="w-full py-3 border-2 border-dashed border-gray-600 hover:border-indigo-500 rounded-lg text-gray-400 hover:text-indigo-400 transition-colors flex items-center justify-center gap-2"
+                >
+                  <span>📁</span>
+                  Upload File
+                </button>
+              </div>
+
+              {/* Uploaded File Info */}
+              {uploadedFileName && (
+                <div className="flex items-center justify-between bg-gray-700/50 rounded-lg px-3 py-2">
+                  <span className="text-sm text-gray-300 truncate">📄 {uploadedFileName}</span>
+                  <button
+                    onClick={clearFile}
+                    className="text-gray-500 hover:text-red-400 transition-colors ml-2"
+                  >
+                    ✕
+                  </button>
+                </div>
+              )}
+
+              {/* Text Area */}
               <div>
                 <label className="block text-sm font-medium text-gray-300 mb-2">
-                  Paste code or text to analyze
+                  {uploadedFileName ? 'File content:' : 'Or paste code/text:'}
                 </label>
                 <textarea
                   value={fileContent}
@@ -900,12 +1123,12 @@ Provide a clear, developer-friendly summary:`;
               >
                 {isAiLoading ? (
                   <>
-                    <span className="animate-spin">&#8987;</span>
+                    <span className="animate-spin">⏳</span>
                     Analyzing...
                   </>
                 ) : (
                   <>
-                    <span>&#10024;</span>
+                    <span>✨</span>
                     Analyze Content
                   </>
                 )}
